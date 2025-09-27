@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,8 +7,8 @@ import numpy as np
 from utils import fftshift, ifftshift
 
 class FreeSpaceProp(nn.Module):
-    def __init__(self, 
-                 wlength_vc, 
+    def __init__(self,
+                 wlength_vc,
                  ridx_air,
                  total_x_num, total_y_num,
                  dx, dy,
@@ -18,9 +19,10 @@ class FreeSpaceProp(nn.Module):
         self.total_y_num = total_y_num
         self.dx = dx
         self.dy = dy
+        self._last_output = None
 
         wlengtheff = wlength_vc / ridx_air # effect wavelength
-        
+
         y, x = (dy * float(total_y_num), dx * float(total_x_num))
 
         fy = torch.linspace(-1 / (2 * dy) + 0.5 / (2 * y), 1 / (2 * dy) - 0.5 / (2 * y), total_y_num)
@@ -40,19 +42,22 @@ class FreeSpaceProp(nn.Module):
                                                                         min=0, max=1))
         phase_change_cplx = torch.complex(torch.cos(phase_change),
                                           torch.sin(phase_change)) * Q # as exp(1i*...)
-        
+
         shifted_phase_change_cplx = torch.fft.ifftshift(phase_change_cplx)
         shifted_phase_change_cplx = shifted_phase_change_cplx[None, None, ...]
 
         self.register_buffer('shifted_phase_change_cplx',
                              shifted_phase_change_cplx)
-        
-        
+        wavelength = torch.tensor(float(wlengtheff), dtype=torch.float32)
+        self.register_buffer('wavenumber', (2 * math.pi / wavelength).view(1, 1, 1, 1))
+
+
     def forward(self, x):
-        
+
         ASpectrum = torch.fft.fft2(x)
         ASpectrum_z = torch.mul(self.shifted_phase_change_cplx, ASpectrum)
         output = torch.fft.ifft2(ASpectrum_z)
+        self._last_output = output
         return output
     
     def update_proplocation(self, x_shift, y_shift, z_shift):
@@ -126,8 +131,8 @@ class FreeSpaceProp(nn.Module):
         return H_final
 
 class FreeSpaceProp_Multich(nn.Module):
-    def __init__(self, 
-                 wlength_vc, 
+    def __init__(self,
+                 wlength_vc,
                  ridx_air,
                  total_x_num, total_y_num,
                  dx, dy,
@@ -138,6 +143,7 @@ class FreeSpaceProp_Multich(nn.Module):
         self.total_y_num = total_y_num
         self.dx = dx
         self.dy = dy
+        self._last_output = None
 
         wlengtheff = torch.tensor(wlength_vc, dtype=torch.float32)[..., None, None].repeat(1, total_x_num, total_y_num) / ridx_air # effect wavelength
         
@@ -168,19 +174,24 @@ class FreeSpaceProp_Multich(nn.Module):
 
         self.register_buffer('shifted_phase_change_cplx',
                              shifted_phase_change_cplx)
-        
-        
+        wavelength = torch.tensor(wlength_vc, dtype=torch.float32)
+        if wavelength.ndim == 0:
+            wavelength = wavelength[None]
+        self.register_buffer('wavenumber', (2 * math.pi / wavelength).view(1, -1, 1, 1))
+
+
     def forward(self, x):
-        
+
         # ASpectrum = torch.fft.fft2(x)
         # ASpectrum_z = torch.mul(self.shifted_phase_change_cplx, ASpectrum)
         # output = torch.fft.ifft2(ASpectrum_z)
         
         U1 = torch.fft.fftn(ifftshift(x), dim=(-2, -1), norm='ortho')
-    
+
         U2 = self.shifted_phase_change_cplx * U1
 
         output = fftshift(torch.fft.ifftn(U2, dim=(-2, -1), norm='ortho'))
+        self._last_output = output
         return output
     
     def update_proplocation(self, x_shift, y_shift, z_shift):
@@ -265,10 +276,14 @@ class MaskBlockPhase(nn.Module):
         self.register_parameter('mask_phase',
                                 nn.Parameter(torch.Tensor(1, in_channel, mask_x_num, mask_y_num),
                                              requires_grad=True))
-        
+        self._last_output = None
+
         freq = np.array(freq, dtype=np.float32)
         ridx_mask = np.array(ridx_mask, dtype=np.float32)
         attenu_factor = np.array(attenu_factor, dtype=np.float32)
+
+        if freq.ndim == 0:
+            freq = freq[None]
 
         if mask_init_method == 'zero':
             nn.init.zeros_(self.mask_phase.data)
@@ -282,7 +297,10 @@ class MaskBlockPhase(nn.Module):
             * freq / c # (n-1)*k used to calculate the height from phase
         self.amp_decay_factor = 2 * np.pi * attenu_factor \
             * freq / c # amplitude decay
-        
+
+        wavenumber = torch.tensor(2 * np.pi * freq / c, dtype=torch.float32)
+        self.register_buffer('wavenumber', wavenumber.view(1, -1, 1, 1))
+
         self.mask_base_thick = mask_base_thick
 
     def forward(self, x):
@@ -307,6 +325,7 @@ class MaskBlockPhase(nn.Module):
             mask_cplx = mask_amp * mask_cplx
 
         output = torch.mul(mask_cplx, x) # should be mul not matmul
+        self._last_output = output
         return output
     
 class Digital_Encoder(nn.Module):

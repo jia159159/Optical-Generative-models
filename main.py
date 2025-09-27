@@ -15,7 +15,7 @@ from diffusers.utils import make_image_grid
 from accelerate import Accelerator, notebook_launcher
 from functools import partial
 
-from utils import _extract_into_tensor, kl_divergence_loss
+from utils import _extract_into_tensor, kl_divergence_loss, compute_optical_residual_penalty
 from models import Snapshot_Optical_Generative_Model, Multicolor_Optical_Generative_Model, Iterative_Optical_Generative_Model
 from pipeline_costum import DDPMPipeline_Costum, DDPMPipeline_Costum_ClsEmb
 
@@ -44,6 +44,14 @@ def parse_args():
     parser.add_argument("--lr_warmup_steps", type=int, default=100)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--num_classes", type=int, default=0, help="For the dataset with class indices")
+    parser.add_argument("--residual_weight", type=float, default=0.0,
+                        help="Weight for the weak-form residual regularization term")
+    parser.add_argument("--residual_noise_std", type=float, default=0.0,
+                        help="Std of additive complex noise for residual Monte Carlo sampling")
+    parser.add_argument("--residual_phase_std", type=float, default=0.0,
+                        help="Std of multiplicative phase noise for residual Monte Carlo sampling")
+    parser.add_argument("--residual_num_samples", type=int, default=1,
+                        help="Number of perturbation samples for residual estimation")
 
     ## for diffusion_digital task
     parser.add_argument("--time_embedding_type_d", type=str, default="positional")
@@ -446,11 +454,25 @@ def train_snapshot(args, dataloader, wz_cls):
                         elif args.scale_type_snst == 'static_mean':
                             static = torch.mean(torch.mean(targets, dim=2, keepdim=True), dim=3, keepdim=True)
                             outputs = 2*static*outputs
-                    
-                    if args.eval_kl_snst:    
-                        loss = F.mse_loss(outputs, targets) + args.kl_ratio_snst * kl_divergence_loss(outputs, targets)
+
+                    if args.eval_kl_snst:
+                        recon_loss = F.mse_loss(outputs, targets) + args.kl_ratio_snst * kl_divergence_loss(outputs, targets)
                     else:
-                        loss = F.mse_loss(outputs, targets)
+                        recon_loss = F.mse_loss(outputs, targets)
+
+                    if args.residual_weight > 0:
+                        residual_penalty = compute_optical_residual_penalty(
+                            accelerator.unwrap_model(model),
+                            dx=args.dxdy,
+                            dy=args.dxdy,
+                            noise_std=args.residual_noise_std,
+                            phase_std=args.residual_phase_std,
+                            num_samples=args.residual_num_samples,
+                        )
+                    else:
+                        residual_penalty = recon_loss.new_zeros(())
+
+                    loss = recon_loss + args.residual_weight * residual_penalty
 
                     accelerator.backward(loss)
 
@@ -460,7 +482,9 @@ def train_snapshot(args, dataloader, wz_cls):
                     optimizer.zero_grad()
 
                 progress_bar.update(1)
-                logs = {"loss": loss.detach().item(), 
+                logs = {"loss": loss.detach().item(),
+                        "recon_loss": recon_loss.detach().item(),
+                        "residual_penalty": residual_penalty.detach().item(),
                         "lr": lr_scheduler.get_last_lr()[0],
                         "step": global_step}
                 progress_bar.set_postfix(**logs)
@@ -622,11 +646,25 @@ def train_multicolor(args, dataloader, wz_cls):
                         elif args.scale_type_mtcl == 'static_mean':
                             static = torch.mean(torch.mean(targets, dim=2, keepdim=True), dim=3, keepdim=True)
                             outputs = 2*static*outputs
-                    
-                    if args.eval_kl_mtcl:    
-                        loss = F.mse_loss(outputs, targets) + args.kl_ratio_mtcl * kl_divergence_loss(outputs, targets)
+
+                    if args.eval_kl_mtcl:
+                        recon_loss = F.mse_loss(outputs, targets) + args.kl_ratio_mtcl * kl_divergence_loss(outputs, targets)
                     else:
-                        loss = F.mse_loss(outputs, targets)
+                        recon_loss = F.mse_loss(outputs, targets)
+
+                    if args.residual_weight > 0:
+                        residual_penalty = compute_optical_residual_penalty(
+                            accelerator.unwrap_model(model),
+                            dx=args.dxdy,
+                            dy=args.dxdy,
+                            noise_std=args.residual_noise_std,
+                            phase_std=args.residual_phase_std,
+                            num_samples=args.residual_num_samples,
+                        )
+                    else:
+                        residual_penalty = recon_loss.new_zeros(())
+
+                    loss = recon_loss + args.residual_weight * residual_penalty
 
                     accelerator.backward(loss)
 
@@ -636,7 +674,9 @@ def train_multicolor(args, dataloader, wz_cls):
                     optimizer.zero_grad()
 
                 progress_bar.update(1)
-                logs = {"loss": loss.detach().item(), 
+                logs = {"loss": loss.detach().item(),
+                        "recon_loss": recon_loss.detach().item(),
+                        "residual_penalty": residual_penalty.detach().item(),
                         "lr": lr_scheduler.get_last_lr()[0],
                         "step": global_step}
                 progress_bar.set_postfix(**logs)
@@ -755,19 +795,34 @@ def train_iterative(args, dataloader, wz_cls):
 
                     noise_pred = model(noisy_images, timesteps, class_labels=labels, return_dict=False)[0]
 
-                    if args.prediction_type_o == "epsilon":    
-                        loss = F.mse_loss(noise_pred, noise)
+                    if args.prediction_type_o == "epsilon":
+                        prediction_loss = F.mse_loss(noise_pred, noise)
                     elif args.prediction_type_o == "sample":
                         alpha_t = _extract_into_tensor(
                             noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
                         )
                         snr_weights = alpha_t / (1 - alpha_t)
                         # use SNR weighting from distillation paper
-                        loss = snr_weights * F.mse_loss(noise_pred.float(), 
-                                                        clean_images.float(), reduction="none")
-                        loss = loss.mean()
+                        prediction_loss = snr_weights * F.mse_loss(noise_pred.float(),
+                                                                    clean_images.float(), reduction="none")
+                        prediction_loss = prediction_loss.mean()
                     else:
                         raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
+
+                    if args.residual_weight > 0:
+                        residual_penalty = compute_optical_residual_penalty(
+                            accelerator.unwrap_model(model),
+                            dx=args.dxdy,
+                            dy=args.dxdy,
+                            noise_std=args.residual_noise_std,
+                            phase_std=args.residual_phase_std,
+                            num_samples=args.residual_num_samples,
+                        )
+                    else:
+                        residual_penalty = prediction_loss.new_zeros(())
+
+                    loss = prediction_loss + args.residual_weight * residual_penalty
+
                     accelerator.backward(loss)
 
                     accelerator.clip_grad_norm_(model.parameters(), 1.0)
@@ -776,7 +831,9 @@ def train_iterative(args, dataloader, wz_cls):
                     optimizer.zero_grad()
 
                 progress_bar.update(1)
-                logs = {"loss": loss.detach().item(), 
+                logs = {"loss": loss.detach().item(),
+                        "prediction_loss": prediction_loss.detach().item(),
+                        "residual_penalty": residual_penalty.detach().item(),
                         "lr": lr_scheduler.get_last_lr()[0],
                         "step": global_step}
                 progress_bar.set_postfix(**logs)
